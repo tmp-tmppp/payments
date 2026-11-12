@@ -1,0 +1,165 @@
+openapi: 3.1.0
+info:
+  title: Chance trading debit endpoint (PROPOSAL)
+  version: 0.1.0-proposal
+  description: |
+    **Proposal.** The one synchronous call of the withdrawal saga (plan FL-C step 2) that payments makes to trading.
+    The owner of trading has not agreed to it yet; payments is built and tested against a fake trading that implements
+    exactly this file (an HTTP server in the tests, an in-memory fake for `APP_ENV=local`).
+
+    - `POST /v1/internal/debits` takes credits out of a user's balance for a withdrawal. It is **idempotent by
+      `withdrawalId`**: a repeat with the same id answers the same result and debits nothing again, so payments may
+      repeat it after a timeout or a lost answer until it gets a definitive one.
+    - A definitive answer is `200` (debited) or `409` (too few credits). Anything else (a timeout, a connection error,
+      `5xx`, an open circuit) is not definitive: the withdrawal stays `requested` and payments tries again. So is
+      another `4xx` (`400`, `403`, `422`): it debited nothing for this body but needs a fix on one side (a payments bug, the
+      client or audience of the token), so the withdrawal waits in `requested`, the job tries again with backoff and
+      keeps the answer in its last error, and nobody's withdrawal is rejected because of a configuration mistake.
+    - Payments sends the header `Idempotency-Key` with the `withdrawalId` (plan REL-03); trading accepts the call
+      without it too.
+    - Caller authentication: a Keycloak client-credentials token of the client `payments` (audience `chance`) as a
+      bearer token. The route is internal: the gateway does not route `/v1/internal`.
+    - The tenant of the debit is `tenantId` of the body. It comes from payments' own withdrawal record, never from a
+      user (plan section 9).
+    - **Amounts.** 1 credit = 1 EUR cent; `amount` is one positive integer from 1 to 1 000 000.
+    - The refund of a failed payout is not a call: payments publishes `WithdrawalFailed`, trading refunds on its own
+      and publishes `WithdrawalRefunded` (see `asyncapi.yaml`, also a proposal).
+servers:
+  - url: http://trading:8081
+    description: Trading by its Kubernetes service name (the port is trading's internal port)
+security:
+  - serviceToken: []
+
+paths:
+  /v1/internal/debits:
+    post:
+      operationId: debitCredits
+      summary: Debit credits for a withdrawal (idempotent by withdrawalId)
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: The `withdrawalId` of the body (payments always sends it); another value is `400`
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DebitRequest'
+      responses:
+        '200':
+          description: The credits are debited (now, or by an earlier call with the same `withdrawalId`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitResult'
+        '400':
+          description: The request is invalid
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: The service token is missing or invalid
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: The token is not the one of the client `payments`
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: |
+            The user's credits are too few (code `insufficient_credits`). Definitive for this `withdrawalId`: a repeat
+            answers `409` again as long as nothing was debited for it, and a debit that was made is never turned into a `409`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: |
+            The `withdrawalId` was debited or refused before for another body (code `idempotency_key_reused`). Payments never
+            provokes it (one withdrawal has one body); it is not definitive for payments, which keeps the withdrawal
+            `requested` and the answer in its last error for someone to look at.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          description: Trading cannot answer now; payments repeats the call with the same `withdrawalId`
+          headers:
+            Retry-After:
+              description: Seconds to wait before the request is repeated
+              schema:
+                type: integer
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+components:
+  securitySchemes:
+    serviceToken:
+      type: oauth2
+      description: Client credentials of the client `payments` of the identity provider (audience `chance`), sent as a bearer token
+      flows:
+        clientCredentials:
+          tokenUrl: http://identity:8080/realms/chance/protocol/openid-connect/token
+          scopes: {}
+
+  schemas:
+    DebitRequest:
+      type: object
+      additionalProperties: false
+      required: [withdrawalId, tenantId, userId, amount]
+      properties:
+        withdrawalId:
+          type: string
+          format: uuid
+          description: The idempotency key of the debit
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          minLength: 1
+          maxLength: 255
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Credits = EUR cents
+    DebitResult:
+      type: object
+      required: [withdrawalId, status]
+      properties:
+        withdrawalId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [debited]
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+          examples: [insufficient_credits]

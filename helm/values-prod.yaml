@@ -1,0 +1,24 @@
+# Prod overrides. The pipeline sets the image tag; secrets come from the Secret payments-env (PAYMENTS_ENV).
+replicaCount: 1
+
+env:
+  APP_ENV: production
+  LOG_LEVEL: info
+  # The issuer is the identity provider's public address as the browser sees it (https://<public host>/realms/chance),
+  # filled by the deploy pipeline from the organization variable PUBLIC_HOST (the repo's ci-cd.yml host-values); leave it
+  # empty here. A deploy without it stops at start with "AUTH_ISSUER is required" instead of rejecting every token
+  # (another "iss" is a 401).
+  AUTH_ISSUER: ""
+  # Where the payment page sends the buyer back (https://<public host>/deposits/success and /deposits/cancelled; the
+  # paths are depositSuccessPath and depositCancelPath of the web chart). Filled by the deploy pipeline from the
+  # organization variable PUBLIC_HOST (the repo's ci-cd.yml host-values); leave both empty here. A deploy without the
+  # public host stops at start with "DEPOSIT_SUCCESS_URL is required" instead of sending buyers back to localhost.
+  DEPOSIT_SUCCESS_URL: ""
+  DEPOSIT_CANCEL_URL: ""
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi

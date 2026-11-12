@@ -1,0 +1,407 @@
+asyncapi: 3.0.0
+info:
+  title: Chance payments events
+  version: 0.1.0
+  description: |
+    Integration events of the payments service on NATS JetStream.
+
+    - Format: CloudEvents 1.0, structured JSON mode. The message body is the whole CloudEvent.
+    - Published on the stream `PAYMENTS`: subjects `chance.payments.>`, file storage, limits retention, 30 days by
+      default (`STREAM_MAX_AGE_DAYS`, the same in every service, so a consumer started later still reads older events),
+      duplicate window 2 minutes. The NATS message header `Nats-Msg-Id` carries the event `id`.
+    - Subject of a published message: `chance.payments.<Event>.<tenantId>`.
+    - Consumed: `TenantCreated` (stream `TENANTS`, published by tenants) and `WithdrawalRefunded` (stream `TRADING`,
+      **a proposal** for the owner of trading: it is not agreed yet; payments starts and keeps working while the stream
+      `TRADING` does not exist and retries until it does).
+    - Delivery is at least once and the events of one tenant keep their order: consumers deduplicate by the event
+      `id`, take the tenant from `tenantid` and ignore fields they do not know.
+    - **Amounts.** `amount` is credits = EUR cents, one positive integer from 1 to 1 000 000.
+    - Events carry ids and amounts, never the names or e-mails of people.
+defaultContentType: application/json
+servers:
+  nats:
+    host: nats:4222
+    protocol: nats
+    description: NATS server with JetStream, reached by its Kubernetes service name (localhost:4222 in local runs)
+
+channels:
+  depositSucceeded:
+    address: chance.payments.DepositSucceeded.{tenantId}
+    description: A deposit was paid; trading credits the user's balance
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      DepositSucceeded:
+        $ref: '#/components/messages/DepositSucceeded'
+  depositFailed:
+    address: chance.payments.DepositFailed.{tenantId}
+    description: A deposit was declined or expired
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      DepositFailed:
+        $ref: '#/components/messages/DepositFailed'
+  withdrawalSucceeded:
+    address: chance.payments.WithdrawalSucceeded.{tenantId}
+    description: A withdrawal was paid out
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      WithdrawalSucceeded:
+        $ref: '#/components/messages/WithdrawalSucceeded'
+  withdrawalFailed:
+    address: chance.payments.WithdrawalFailed.{tenantId}
+    description: The payout of a debited withdrawal failed; trading refunds the credits (compensation)
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      WithdrawalFailed:
+        $ref: '#/components/messages/WithdrawalFailed'
+  tenantCreated:
+    address: chance.tenants.TenantCreated.{tenantId}
+    description: Consumed from the stream TENANTS. Payments creates and migrates the tenant's schema (idempotent, through an inbox)
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      TenantCreated:
+        $ref: '#/components/messages/TenantCreated'
+  withdrawalRefunded:
+    address: chance.trading.WithdrawalRefunded.{tenantId}
+    description: PROPOSAL. Consumed from the stream TRADING. Trading refunded the credits of a failed withdrawal; payments marks it refunded
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      WithdrawalRefunded:
+        $ref: '#/components/messages/WithdrawalRefunded'
+
+operations:
+  publishDepositSucceeded:
+    action: send
+    channel:
+      $ref: '#/channels/depositSucceeded'
+    summary: Published in the transaction that marks the deposit succeeded
+  publishDepositFailed:
+    action: send
+    channel:
+      $ref: '#/channels/depositFailed'
+    summary: Published in the transaction that marks the deposit failed
+  publishWithdrawalSucceeded:
+    action: send
+    channel:
+      $ref: '#/channels/withdrawalSucceeded'
+    summary: Published in the transaction that marks the withdrawal paid out
+  publishWithdrawalFailed:
+    action: send
+    channel:
+      $ref: '#/channels/withdrawalFailed'
+    summary: Published in the transaction that marks the withdrawal failed
+  receiveTenantCreated:
+    action: receive
+    channel:
+      $ref: '#/channels/tenantCreated'
+    summary: Creates the schema of the tenant; the event id is stored in the same transaction
+  receiveWithdrawalRefunded:
+    action: receive
+    channel:
+      $ref: '#/channels/withdrawalRefunded'
+    summary: PROPOSAL. Marks the withdrawal refunded; the event id is stored in the same transaction
+
+components:
+  messages:
+    DepositSucceeded:
+      name: DepositSucceeded
+      title: Deposit succeeded
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/NatsHeaders'
+      payload:
+        $ref: '#/components/schemas/DepositSucceededEvent'
+    DepositFailed:
+      name: DepositFailed
+      title: Deposit failed
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/NatsHeaders'
+      payload:
+        $ref: '#/components/schemas/DepositFailedEvent'
+    WithdrawalSucceeded:
+      name: WithdrawalSucceeded
+      title: Withdrawal succeeded
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/NatsHeaders'
+      payload:
+        $ref: '#/components/schemas/WithdrawalSucceededEvent'
+    WithdrawalFailed:
+      name: WithdrawalFailed
+      title: Withdrawal failed
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/NatsHeaders'
+      payload:
+        $ref: '#/components/schemas/WithdrawalFailedEvent'
+    TenantCreated:
+      name: TenantCreated
+      title: Tenant created (consumed)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/TenantCreatedEvent'
+    WithdrawalRefunded:
+      name: WithdrawalRefunded
+      title: Withdrawal refunded (consumed, proposal)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/WithdrawalRefundedEvent'
+
+  schemas:
+    NatsHeaders:
+      type: object
+      required: [Nats-Msg-Id]
+      properties:
+        Nats-Msg-Id:
+          type: string
+          format: uuid
+          description: Equals the CloudEvent id; JetStream drops a repeated id inside the duplicate window
+    Amount:
+      type: integer
+      minimum: 1
+      maximum: 1000000
+      description: Credits = EUR cents
+    CloudEventEnvelope:
+      type: object
+      description: CloudEvents 1.0 attributes shared by all events of this service
+      required:
+        - specversion
+        - id
+        - source
+        - type
+        - subject
+        - time
+        - datacontenttype
+        - tenantid
+        - correlationid
+        - causationid
+        - data
+      properties:
+        specversion:
+          type: string
+          const: '1.0'
+        id:
+          type: string
+          format: uuid
+          description: UUIDv7, the deduplication key
+        source:
+          type: string
+          const: /chance/payments
+        type:
+          type: string
+          pattern: '^si\.chance\.payments\.[A-Za-z]+\.v[0-9]+$'
+        subject:
+          type: string
+          description: '`deposit/<depositId>` or `withdrawal/<withdrawalId>`'
+        time:
+          type: string
+          format: date-time
+        datacontenttype:
+          type: string
+          const: application/json
+        tenantid:
+          type: string
+          format: uuid
+          description: Tenant context (extension attribute)
+        correlationid:
+          type: string
+          minLength: 1
+          description: Id that ties the events of one business operation together (extension attribute)
+        causationid:
+          type: string
+          minLength: 1
+          description: Id of the request or event that caused this event (extension attribute)
+        data:
+          type: object
+    DepositSucceededData:
+      type: object
+      additionalProperties: false
+      required: [depositId, tenantId, userId, amount, succeededAt]
+      properties:
+        depositId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Amount'
+        succeededAt:
+          type: string
+          format: date-time
+    DepositFailedData:
+      type: object
+      additionalProperties: false
+      required: [depositId, tenantId, userId, amount, reason, failedAt]
+      properties:
+        depositId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Amount'
+        reason:
+          type: string
+          enum: [declined, expired, provider_unavailable]
+        failedAt:
+          type: string
+          format: date-time
+    WithdrawalSucceededData:
+      type: object
+      additionalProperties: false
+      required: [withdrawalId, tenantId, userId, amount, paidOutAt]
+      properties:
+        withdrawalId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Amount'
+        paidOutAt:
+          type: string
+          format: date-time
+    WithdrawalFailedData:
+      type: object
+      additionalProperties: false
+      required: [withdrawalId, tenantId, userId, amount, reason, failedAt]
+      properties:
+        withdrawalId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Amount'
+        reason:
+          type: string
+          enum: [forced, declined, payout_lost]
+        failedAt:
+          type: string
+          format: date-time
+    DepositSucceededEvent:
+      allOf:
+        - $ref: '#/components/schemas/CloudEventEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.payments.DepositSucceeded.v1
+            subject:
+              pattern: '^deposit/'
+            data:
+              $ref: '#/components/schemas/DepositSucceededData'
+    DepositFailedEvent:
+      allOf:
+        - $ref: '#/components/schemas/CloudEventEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.payments.DepositFailed.v1
+            subject:
+              pattern: '^deposit/'
+            data:
+              $ref: '#/components/schemas/DepositFailedData'
+    WithdrawalSucceededEvent:
+      allOf:
+        - $ref: '#/components/schemas/CloudEventEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.payments.WithdrawalSucceeded.v1
+            subject:
+              pattern: '^withdrawal/'
+            data:
+              $ref: '#/components/schemas/WithdrawalSucceededData'
+    WithdrawalFailedEvent:
+      allOf:
+        - $ref: '#/components/schemas/CloudEventEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.payments.WithdrawalFailed.v1
+            subject:
+              pattern: '^withdrawal/'
+            data:
+              $ref: '#/components/schemas/WithdrawalFailedData'
+    ConsumedEnvelope:
+      type: object
+      description: |
+        What payments reads of an event it consumes. The attributes it does not use are not listed; unknown
+        attributes and data fields are ignored.
+      required: [specversion, id, type, tenantid, data]
+      properties:
+        specversion:
+          type: string
+          const: '1.0'
+        id:
+          type: string
+          minLength: 1
+          description: The deduplication key; stored in the inbox
+        type:
+          type: string
+        tenantid:
+          type: string
+          format: uuid
+        data:
+          type: object
+    TenantCreatedEvent:
+      description: Published by tenants on the stream TENANTS (subject `chance.tenants.TenantCreated.<tenantId>`)
+      allOf:
+        - $ref: '#/components/schemas/ConsumedEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.tenants.TenantCreated.v1
+            data:
+              type: object
+              required: [tenantId]
+              properties:
+                tenantId:
+                  type: string
+                  format: uuid
+    WithdrawalRefundedEvent:
+      description: |
+        PROPOSAL for the owner of trading. Published by trading on the stream `TRADING` (subject
+        `chance.trading.WithdrawalRefunded.<tenantId>`) when it refunded the credits of a withdrawal that payments
+        reported as failed. Idempotent on the trading side: one event per withdrawal id.
+      allOf:
+        - $ref: '#/components/schemas/ConsumedEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.trading.WithdrawalRefunded.v1
+            data:
+              type: object
+              required: [withdrawalId, userId, amount]
+              properties:
+                withdrawalId:
+                  type: string
+                  format: uuid
+                userId:
+                  type: string
+                amount:
+                  $ref: '#/components/schemas/Amount'

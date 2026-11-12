@@ -1,0 +1,7 @@
+apiVersion: v2
+name: payments
+description: Payments of Chance (deposits and withdrawals through the external payment API, withdrawal saga).
+type: application
+# Chart version: bump on every change to the chart. The image tag is set by the pipeline (sha-<commit>).
+version: 0.2.0
+appVersion: "0.1.0"

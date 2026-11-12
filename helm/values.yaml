@@ -1,0 +1,111 @@
+# Defaults, safe for a local cluster. values-dev.yaml and values-prod.yaml override them; the pipeline sets
+# image.repository, image.tag (sha-<commit>) and image.digest with --set-string and never puts secrets into
+# values.
+
+image:
+  repository: docker.io/example/payments
+  tag: latest
+  # sha256:<64 hex>; when set, the image is pulled by digest (the tag stays for people).
+  digest: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  port: 8080
+
+# Metrics (REQ-20): GET /metrics is served on a port of its own, never on service.port, so that the gateway can never
+# route it. The port is rendered as METRICS_PORT and as the container port "metrics"; the Pod annotations
+# prometheus.io/scrape, prometheus.io/port and prometheus.io/path tell Prometheus where to scrape. The Service does not
+# expose it.
+metrics:
+  port: 9464
+
+# Further Pod annotations (the prometheus.io ones come from metrics.port); the pipeline adds checksum/app-env so the Pods restart when the Secret changes.
+podAnnotations: {}
+
+# Secret settings come from this Secret as environment variables: DATABASE_URL, PROVIDER_API_KEY, WEBHOOK_SECRET and
+# KEYCLOAK_CLIENT_SECRET. The pipeline creates it from the organization secret PAYMENTS_ENV; it is optional so the
+# chart renders without it (a Pod without a required setting stops at start with a message that names it).
+existingSecret: payments-env
+
+# Non-secret settings, rendered into a ConfigMap (all values are strings). Every key is described in README.md.
+env:
+  APP_ENV: production
+  LOG_LEVEL: info
+  NATS_URL: nats://nats:4222
+  PROVIDER_BASE_URL: http://payment-provider:8080
+  # The debit at trading (REQ-17): over gRPC on trading's port grpc (8082, plain HTTP/2, host:port without a scheme), or
+  # over REST on trading's internal port (8081) with TRADING_DEBIT_TRANSPORT=rest. Both addresses stay set, so switching
+  # back is one value.
+  TRADING_DEBIT_TRANSPORT: grpc
+  TRADING_GRPC_URL: trading:8082
+  TRADING_BASE_URL: http://trading:8081
+  KEYCLOAK_TOKEN_URL: http://identity:8080/realms/chance/protocol/openid-connect/token
+  KEYCLOAK_CLIENT_ID: payments
+  # Where the payment page sends the buyer back to: the web application's public address. Fixed values, never from a request.
+  DEPOSIT_SUCCESS_URL: http://localhost:5173/deposits/success
+  DEPOSIT_CANCEL_URL: http://localhost:5173/deposits/cancelled
+  AUTH_JWKS_URL: http://identity:8080/realms/chance/protocol/openid-connect/certs
+  AUTH_ISSUER: http://localhost:8081/realms/chance
+  AUTH_AUDIENCE: chance
+  AUTH_ROLES_CLAIM: realm_access.roles
+  AUTH_TENANT_CLAIM: organization
+  DATABASE_POOL_MAX: "5"
+  OUTBOX_POLL_MS: "300"
+  # Max age of the PAYMENTS stream and how long the outbox keeps published rows; the same in every service, so a service
+  # started later still reads the older events (decision of 2026-11-11). Processed and webhook ids are kept one day longer.
+  STREAM_MAX_AGE_DAYS: "30"
+  JOB_POLL_MS: "1000"
+  # How often the mounted runtime file is also read, because a ConfigMap update swaps a link and a watch can miss it.
+  RUNTIME_CONFIG_POLL_MS: "10000"
+  # Drain after SIGTERM: readiness answers 503 and the Pod keeps serving for this long before it closes. It has to fit
+  # into terminationGracePeriodSeconds (30 in the Deployment) together with the 10 seconds a close may take.
+  SHUTDOWN_DELAY_MS: "5000"
+
+# Runtime keys (ADR-037), rendered into a second ConfigMap that is mounted as a DIRECTORY (never subPath: a subPath mount
+# is never updated) at /etc/payments/runtime. The service re-reads runtime.json when it changes, without a restart:
+#   helm upgrade ... --set runtime.forcePayoutFailure=true
+# forcePayoutFailure true: payments declines every new payout itself (reason "forced") and the withdrawal fails.
+runtime:
+  forcePayoutFailure: false
+  logLevel: info
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+probes:
+  startup:
+    path: /health/startup
+    periodSeconds: 2
+    failureThreshold: 30
+  readiness:
+    path: /health/ready
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    path: /health/live
+    periodSeconds: 10
+    failureThreshold: 3
+
+# Admits only the API gateway to the HTTP port (and the payment provider, which posts its webhooks to it). Needs a network
+# policy engine in the cluster (plan section 9).
+networkPolicy:
+  enabled: false
+  gatewayNamespaceLabels:
+    kubernetes.io/metadata.name: gateway
+  gatewayPodLabels:
+    app.kubernetes.io/name: traefik
+  providerPodLabels:
+    app.kubernetes.io/name: payment-provider
+  # The namespace of Prometheus (selected by its kubernetes.io/metadata.name label): admitted on the metrics port only.
+  metrics:
+    namespace: monitoring
+
+# Smoke test run by "helm test" after every deploy: asks the readiness endpoint through the Service.
+smokeTest:
+  image: docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4

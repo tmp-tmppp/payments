@@ -1,0 +1,11 @@
+# The runtime keys of ADR-037 as the file runtime.json. It is mounted as a directory and watched by the service, so a
+# change of these values reaches running Pods without a restart; the Deployment's config checksum does not include it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "payments.fullname" . }}-runtime
+  labels:
+    {{- include "payments.labels" . | nindent 4 }}
+data:
+  runtime.json: |
+    {{- toPrettyJson .Values.runtime | nindent 4 }}

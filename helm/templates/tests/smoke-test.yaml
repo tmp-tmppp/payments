@@ -1,0 +1,40 @@
+# "helm test" after every deploy: the readiness endpoint answers through the Service (it checks the database).
+# A failure makes the pipeline roll the release back (ADR-048).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "payments.fullname" . }}-smoke-test
+  labels:
+    {{- include "payments.labels" . | nindent 4 }}
+    app.kubernetes.io/component: smoke-test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: smoke-test
+      image: {{ .Values.smokeTest.image }}
+      command:
+        - wget
+        - -q
+        - -T
+        - "5"
+        - -O
+        - "-"
+        - "http://{{ include "payments.fullname" . }}:{{ .Values.service.port }}{{ .Values.probes.readiness.path }}"
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      securityContext:
+        {{- include "payments.containerSecurityContext" . | nindent 8 }}

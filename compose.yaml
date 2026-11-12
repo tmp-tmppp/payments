@@ -1,0 +1,92 @@
+# Local run of the payments service with its dependencies: PostgreSQL 18, NATS with JetStream, and the mock payment
+# provider built from the sibling folder ../payment-provider.
+#   docker compose up -d --build
+#   curl http://localhost:8080/health/ready
+# The identity provider and trading are not part of this file. Tokens are always verified, so AUTH_JWKS_URL must reach an
+# identity provider (by default the one on the host at port 8081; AUTH_ISSUER stays the address the browser sees). Without
+# TRADING_GRPC_URL (or, with TRADING_DEBIT_TRANSPORT=rest, TRADING_BASE_URL) and KEYCLOAK_TOKEN_URL, APP_ENV=local lets an
+# in-memory trading answer the debit call; set both (and KEYCLOAK_CLIENT_SECRET) to call a real trading.
+# TenantCreated arrives from the tenants service over NATS; to try payments alone, LOCAL_TENANT_IDS=<uuid>,<uuid> creates
+# those tenants' schemas at start.
+# The passwords, the API key and the webhook secret below are local development values only; real ones live in the Secret
+# payments-env (and payment-provider-env).
+name: chance-payments
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments # hooks:allow local development only
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2.15.2-alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+
+  payment-provider:
+    build: ../payment-provider
+    environment:
+      APP_ENV: local
+      PORT: "8080"
+      PROVIDER_API_KEY: provider-local-api-key # hooks:allow local development only
+      WEBHOOK_SECRET: provider-local-webhook-secret # hooks:allow local development only
+      WEBHOOK_URL: http://payments:8080/v1/webhooks/payment-provider
+      # The payment page as the buyer's browser reaches it.
+      PUBLIC_BASE_URL: http://localhost:8082
+    ports:
+      - "127.0.0.1:8082:8080"
+
+  payments:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+      payment-provider:
+        condition: service_started
+    environment:
+      APP_ENV: local
+      PORT: "8080"
+      DATABASE_URL: postgres://payments:payments@postgres:5432/payments # hooks:allow local development only
+      NATS_URL: nats://nats:4222
+      PROVIDER_BASE_URL: http://payment-provider:8080
+      PROVIDER_API_KEY: provider-local-api-key # hooks:allow local development only
+      WEBHOOK_SECRET: provider-local-webhook-secret # hooks:allow local development only
+      DEPOSIT_SUCCESS_URL: http://localhost:5173/deposits/success
+      DEPOSIT_CANCEL_URL: http://localhost:5173/deposits/cancelled
+      AUTH_JWKS_URL: http://host.docker.internal:8081/realms/chance/protocol/openid-connect/certs
+      # The debit goes over gRPC by default (REQ-17): TRADING_GRPC_URL is trading's gRPC port, host:port without a scheme
+      # (trading:8082). With TRADING_DEBIT_TRANSPORT=rest it goes to TRADING_BASE_URL, trading's internal port 8081.
+      # Without the address of the chosen transport, or without KEYCLOAK_TOKEN_URL (and KEYCLOAK_CLIENT_SECRET), the
+      # debit call goes to the in-memory trading; set TRADING_GRPC_URL and those to call a real trading.
+      TRADING_BASE_URL: http://trading:8081
+      LOCAL_TENANT_IDS: ${LOCAL_TENANT_IDS:-}
+      # The runtime file (ADR-037) of this run: edit ./local-runtime/runtime.json, for example {"forcePayoutFailure": true}.
+      RUNTIME_CONFIG_DIR: /etc/payments/runtime
+      RUNTIME_CONFIG_POLL_MS: "2000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./local-runtime:/etc/payments/runtime:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  postgres-data:
+  nats-data:

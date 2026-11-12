@@ -1,0 +1,19 @@
+// Strict compiler settings for the type check: source, tests and the tool configuration, without output.
+// The build uses tsconfig.build.json, which compiles only src/ to dist/.
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src", "tests", "vitest.config.ts", "vitest.integration.config.ts"]
+}

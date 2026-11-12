@@ -1,0 +1,3 @@
+# Pipeline and deploy definitions change what runs in prod: the other team member reviews them.
+/.github/ @radov02 @DominikkMaximus
+/helm/ @radov02 @DominikkMaximus

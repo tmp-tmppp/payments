@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Values of the payments chart",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "replicaCount", "service", "metrics", "existingSecret", "env", "runtime", "resources", "probes", "networkPolicy", "smokeTest"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64})?$" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "GET /metrics is served on this port, never on service.port (the template refuses equal ports).",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    },
+    "podAnnotations": {
+      "type": "object",
+      "description": "The prometheus.io/* annotations are set by the chart from metrics.port; they cannot be set here.",
+      "propertyNames": { "not": { "pattern": "^prometheus\\.io/" } },
+      "additionalProperties": { "type": "string" }
+    },
+    "existingSecret": { "type": "string", "minLength": 1 },
+    "env": {
+      "type": "object",
+      "description": "Non-secret settings only; secrets belong in the Secret named by existingSecret. The runtime keys belong in runtime (FORCE_PAYOUT_FAILURE here would be overridden by the file anyway).",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "not": { "enum": ["DATABASE_URL", "PROVIDER_API_KEY", "WEBHOOK_SECRET", "KEYCLOAK_CLIENT_SECRET", "PORT", "METRICS_PORT", "RUNTIME_CONFIG_DIR", "FORCE_PAYOUT_FAILURE"] }
+      },
+      "properties": {
+        "TRADING_DEBIT_TRANSPORT": { "type": "string", "enum": ["grpc", "rest"], "description": "The transport of the debit at trading (REQ-17)." },
+        "TRADING_GRPC_URL": {
+          "type": "string",
+          "pattern": "^(\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*):[0-9]{1,5}$",
+          "description": "trading's gRPC address, host:port without a scheme (the service refuses a port outside 1 to 65535 at start)."
+        }
+      },
+      "additionalProperties": { "type": "string" }
+    },
+    "runtime": {
+      "type": "object",
+      "description": "Runtime keys (ADR-037), rendered into runtime.json of a ConfigMap that is mounted as a directory and watched.",
+      "additionalProperties": false,
+      "required": ["forcePayoutFailure"],
+      "properties": {
+        "forcePayoutFailure": { "type": "boolean" },
+        "logLevel": { "type": "string", "enum": ["fatal", "error", "warn", "info", "debug", "trace", "silent"] }
+      }
+    },
+    "resources": { "type": "object" },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startup", "readiness", "liveness"],
+      "properties": {
+        "startup": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "gatewayNamespaceLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "gatewayPodLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "providerPodLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "metrics": {
+          "type": "object",
+          "description": "The namespace of Prometheus, admitted on the metrics port only.",
+          "additionalProperties": false,
+          "required": ["namespace"],
+          "properties": { "namespace": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" } }
+        }
+      }
+    },
+    "smokeTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": { "image": { "type": "string", "minLength": 1 } }
+    }
+  },
+  "definitions": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "periodSeconds", "failureThreshold"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

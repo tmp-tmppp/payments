@@ -1,0 +1,104 @@
+// The debit of a withdrawal over gRPC: the call payments makes to trading in step 2 of the withdrawal saga (REQ-17,
+// ADR-023). The contract is written first and the server follows it: src/web/grpc/ loads this very file at start.
+//
+// A second transport over the SAME use case as `POST /v1/internal/debits` (contracts/internal.openapi.yaml): one
+// idempotency store keyed by `withdrawal_id`, so the two transports can never disagree. A debit made over REST answers
+// a repeat over gRPC with the stored result (and the other way round); the credits are debited once.
+//
+// How to call
+//   - Address: trading:8082 (the Service port `grpc`; `GRPC_PORT`, default 8082). Plain HTTP/2 (no TLS), like the
+//     internal REST port 8081: inside the cluster the NetworkPolicy admits only the pods of payments to this port.
+//   - Authentication: the bearer token of the client `payments` (identity provider, client-credentials grant, audience
+//     `chance`) in the metadata key `authorization`, value `Bearer <token>`. It is verified exactly like the REST
+//     internal endpoints: signature, issuer, audience, `exp` required, client id from the claim `azp`. The tenant never
+//     comes from the token, only from `tenant_id`.
+//   - Deadline: always set one (a client without a deadline waits for as long as trading works). The server honours the
+//     deadline it receives: the call ends with DEADLINE_EXCEEDED when it passes, and a call that is already cancelled
+//     or past its deadline when it reaches the handler starts no work. A debit that has begun is completed and
+//     committed even when the client has given up (a transaction is never torn off half way); repeating the call with
+//     the same `withdrawal_id` then returns the stored result. Suggested deadline: 3 seconds.
+//   - Optional metadata `x-correlation-id` (letters, digits, `.`, `_`, `:`, `-`, 1 to 128 characters; anything else is
+//     replaced by a new id): it ties the log lines and the ledger events of the call together and comes back in the
+//     trailing metadata of every answer. `idempotency-key` is not read: `withdrawal_id` is the key.
+//
+// Idempotency
+//   The debit is idempotent by `withdrawal_id`. Both answers are definitive and stored under it: a repeat of a debit that
+//   was made answers OK again, a repeat of one refused for too few credits answers FAILED_PRECONDITION again (a later
+//   deposit never turns an old refusal into a debit). A repeat may be sent after a timeout or a lost answer, until a
+//   definitive answer arrives. The same `withdrawal_id` with another user, tenant or amount is ALREADY_EXISTS, never a
+//   second debit.
+//
+// Status codes (the numbers in brackets are the HTTP statuses of the REST endpoint with the same meaning)
+//   OK                   (200) debited now, or by an earlier call with the same `withdrawal_id`. Definitive.
+//   FAILED_PRECONDITION  (409) the user's credits are too few; reason `insufficient_credits`. Definitive and stored.
+//   ALREADY_EXISTS       (422) `withdrawal_id` was debited or refused before for another body; reason
+//                              `idempotency_key_reused`. Not definitive for payments: someone has to look at it.
+//   INVALID_ARGUMENT     (400) a field is missing or outside its bounds; reason `validation_failed`; the message names
+//                              each field.
+//   UNAUTHENTICATED      (401) the `authorization` metadata is missing or is not a valid bearer token; reason
+//                              `unauthorized`.
+//   PERMISSION_DENIED    (403) a valid token that is not the client `payments` (another service, or a user's token);
+//                              reason `forbidden`.
+//   UNAVAILABLE          (503) not definitive, repeat the call with the same `withdrawal_id`. Sent by trading with the
+//                              reason `concurrent_update` (the accounts kept changing) or
+//                              `identity_provider_unavailable` (the identity provider's keys cannot be fetched), and then
+//                              the trailing metadata `retry-after` says how many seconds to wait. Made by the gRPC library,
+//                              not by trading, when there is no connection or trading is shutting down (a closing server
+//                              refuses the calls that still reach it, also on a connection that is already open): it has
+//                              no `chance-problem-code` and no `retry-after`, so repeat after a backoff of your own.
+//   DEADLINE_EXCEEDED    the deadline passed; the debit may or may not have been made: repeat the call. Made by the
+//                              client's library as a rule; trading sends it, with the reason `deadline_exceeded`, only for
+//                              a call that reaches its handler already past its deadline.
+//   INTERNAL             (500) a bug or a failure that is not transient; reason `internal_error`. Not definitive.
+//   RESOURCE_EXHAUSTED   a message over 16 KiB, refused by the library. A debit is a few dozen bytes.
+//   The answers that trading itself sends carry the trailing metadata `chance-problem-code` (the stable machine-readable code above,
+//   the same as `code` in the REST problem) and `x-correlation-id`. The statuses that the gRPC library makes carry none
+//   of `chance-problem-code`, `retry-after` and `x-correlation-id`: UNAVAILABLE without a connection or from a server that is shutting
+//   down, a DEADLINE_EXCEEDED or CANCELLED made by the client's library, and RESOURCE_EXHAUSTED. Branch on `chance-problem-code` and
+//   `retry-after` only when they are present. The status message is a human-readable text, never a contract.
+//
+// Fields and bounds are those of the REST body `DebitRequest`; a field that is absent reads as its default (an empty
+// text, 0) and is refused like any other invalid value. Unknown fields are ignored (protobuf's rule), where the REST
+// body refuses them with 400.
+syntax = "proto3";
+
+package chance.trading.v1;
+
+// Debits of withdrawals: the one call payments makes to trading (client `payments` only).
+service Debits {
+  // Takes `amount` whole credits from the user's balance for the withdrawal `withdrawal_id`, once.
+  rpc DebitCredits(DebitRequest) returns (DebitReply);
+}
+
+// Same fields, meaning and bounds as `DebitRequest` of contracts/internal.openapi.yaml.
+message DebitRequest {
+  // The withdrawal's id (payments' record) and the idempotency key of the debit. A UUID (any letter case).
+  string withdrawal_id = 1;
+  // The tenant of the debit, from payments' own withdrawal record, never from a user. A UUID. trading remembers the
+  // tenant of every `withdrawal_id`, so the same id with another tenant is ALREADY_EXISTS.
+  string tenant_id = 2;
+  // The user's id (the token subject): 1 to 255 characters, no control characters, no surrounding spaces. A user
+  // without an account has a balance of 0.
+  string user_id = 3;
+  // Whole credits (1 credit = 1 EUR cent): 1 to 1 000 000.
+  int32 amount = 4;
+}
+
+// What the debit did. The REST answer has one status, `debited`; a refusal is never a reply (FAILED_PRECONDITION).
+enum DebitStatus {
+  // Never sent by the server; the value of a reply that was not filled in.
+  DEBIT_STATUS_UNSPECIFIED = 0;
+  // The credits are debited (REST `status: "debited"`).
+  DEBIT_STATUS_DEBITED = 1;
+}
+
+// The answer of a debit that was made (now, or by an earlier call with the same `withdrawal_id`).
+message DebitReply {
+  // The `withdrawal_id` of the request, in lower case.
+  string withdrawal_id = 1;
+  DebitStatus status = 2;
+  // The credits that were debited: the request's `amount`, which a repeat must match exactly (another amount is
+  // ALREADY_EXISTS), so it is also the amount of the earlier call. REST does not repeat it in its body; the balance
+  // after the debit is told by neither transport.
+  int32 amount = 3;
+}

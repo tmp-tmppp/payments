@@ -1,0 +1,11 @@
+// Production build: src/ compiles to dist/ as ES modules for Node.js 24; tests never reach dist/.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": true
+  },
+  "include": ["src"]
+}

@@ -1,0 +1,557 @@
+openapi: 3.1.0
+info:
+  title: Chance payments API
+  version: 0.1.0
+  description: |
+    Deposits and withdrawals of Chance through the external payment API, and the withdrawal saga (plan section 6.6).
+
+    - Every endpoint except the health probes and the provider webhook needs a bearer JWT issued by the identity
+      provider. Only the roles `trader` and `tenant-admin` may deposit and withdraw.
+    - The tenant and the user of the caller come only from the token (claims `organization` and `sub`), never from the
+      path, the query or the body. A deposit or withdrawal of another tenant or another user answers `404`, so its
+      existence is not revealed.
+    - **Amounts.** 1 credit = 1 EUR cent. Every amount (here, in the database, in events, in the debit call and in the
+      call to the provider) is one positive integer named `amount`, from 1 to 1 000 000. There is no conversion and no
+      currency field: the provider is always called in `EUR`.
+    - `POST /v1/deposits` and `POST /v1/withdrawals` need an `Idempotency-Key`. The same key with the same body (from
+      the same user) answers with the resource made the first time; the same key with another body answers `409`
+      `idempotency_key_reused`.
+    - The return URLs of the checkout page (`successUrl`, `cancelUrl`) are fixed values of the service configuration.
+      A request cannot send them: a body with any field other than `amount` is a `400`.
+    - Errors are RFC 9457 `application/problem+json`. A `503` always carries `Retry-After`.
+    - A request for a tenant whose schema does not exist yet (the event TenantCreated is not processed) answers `503`
+      `tenant_not_ready` with `Retry-After`.
+    - The gateway routes the prefixes `/v1/deposits`, `/v1/withdrawals` and `/v1/webhooks/payment-provider`; the health
+      paths are not routed by the gateway.
+servers:
+  - url: http://localhost:8080
+    description: Local run
+tags:
+  - name: Deposits
+    description: Buy credits through the provider's checkout page
+  - name: Withdrawals
+    description: Pay credits out (a saga with a refund when the payout fails)
+  - name: Webhooks
+    description: Calls from the payment provider
+  - name: Health
+    description: Kubernetes probes
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/deposits:
+    post:
+      tags: [Deposits]
+      operationId: createDeposit
+      summary: Start a deposit and get the provider's checkout link
+      description: |
+        Trader or tenant admin. Stores a `pending` deposit (committed first), then asks the provider for a checkout
+        session with no database transaction open (the deposit id is its idempotency key) and returns the checkout link;
+        the buyer pays on the provider's page. The deposit is completed by the provider's webhook or by the service's own
+        read-back of the session, never by this call. A pending deposit ends as `failed` only when the provider's session
+        reads back as expired or declined (or the provider no longer knows it): reason `expired` or `declined`; a
+        completed session always wins. If the provider cannot be reached the call fails with `503` and `Retry-After`; the
+        deposit stays `pending` without a link, the same Idempotency-Key finishes it, and the service creates the
+        session itself when it can. A deposit that has no session after 30 minutes fails with `provider_unavailable`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDepositRequest'
+      responses:
+        '201':
+          description: Deposit made; `checkoutUrl` is where the buyer pays
+          headers:
+            Location:
+              description: The status link, `/v1/deposits/{id}`
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deposit'
+        '200':
+          description: The same Idempotency-Key and body as an earlier call; the deposit made then, in its state now
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deposit'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/IdempotencyKeyReused'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/deposits/{id}:
+    get:
+      tags: [Deposits]
+      operationId: getDeposit
+      summary: Status of a deposit
+      description: Trader or tenant admin, only the caller's own deposits. The web UI polls it after the buyer came back from the checkout page.
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: The deposit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deposit'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/webhooks/payment-provider:
+    post:
+      tags: [Webhooks]
+      operationId: receiveProviderWebhook
+      summary: Event from the payment provider
+      description: |
+        Public: no user token. The signature is the only proof of origin. The header `Provider-Signature:
+        t=<unix seconds>,v1=<hex>` is `HMAC-SHA256(key = the webhook secret, message = "<t>.<raw body>")`, checked over
+        the body exactly as received, in constant time, against every `v1` of the header; a `t` more than 300 seconds
+        from now is refused. The body is thin: it names the event and the object, nothing more.
+
+        After the signature, the service stores the provider event id (a repeat is answered `200` with status
+        `duplicate` and changes nothing), reads the object back from the provider (`GET`) and acts on the state it reads,
+        never on the type of the event. The ids in the object's metadata (tenant and deposit or withdrawal) are trusted
+        only after the signature check and the read back.
+      security: []
+      parameters:
+        - name: Provider-Signature
+          in: header
+          required: true
+          description: '`t=<unix seconds>,v1=<hex>`; may carry several `v1` entries'
+          schema:
+            type: string
+            maxLength: 1024
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderEvent'
+      responses:
+        '200':
+          description: The event was handled (or was a repeat, or named an object this service does not know). The provider stops retrying.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/withdrawals:
+    post:
+      tags: [Withdrawals]
+      operationId: createWithdrawal
+      summary: Request a withdrawal
+      description: |
+        Trader or tenant admin. Stores the withdrawal as `requested`, then asks trading to debit the credits
+        (idempotent by the withdrawal id; timeout, retry with backoff and a circuit breaker).
+
+        - Trading debited: the withdrawal is `debited`, answered `202 Accepted` with a status link; a background job
+          sends the payout and ends the saga (`paid_out`, or `failed` and later `refunded`).
+        - Trading answered `409` (too few credits): `rejected`, `409` `insufficient_credits`.
+        - The circuit to trading was already open before any call was sent: nothing is debited, the withdrawal is
+          `rejected`, `503` `trading_unavailable` with `Retry-After`.
+        - Timeout or lost answer after the call was sent (the debit may have happened): the withdrawal stays
+          `requested` and the answer is `202 Accepted` with the status link; a background job repeats the debit with
+          the same key until trading answers definitively.
+
+        A rejected withdrawal is a stored resource: the `409` and `503` answers carry its id (`withdrawalId`) and
+        its link in `Location`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWithdrawalRequest'
+      responses:
+        '202':
+          description: Accepted (`requested` or `debited`); follow the status link
+          headers:
+            Location:
+              description: The status link, `/v1/withdrawals/{id}`
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Withdrawal'
+        '200':
+          description: The same Idempotency-Key and body as an earlier call, which has reached `paid_out`, `failed` or `refunded` since; the withdrawal in its state now
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Withdrawal'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            The withdrawal was rejected for too few credits (`insufficient_credits`, with `withdrawalId`), or the
+            Idempotency-Key was used with another body (`idempotency_key_reused`)
+          headers:
+            Location:
+              description: The status link of the rejected withdrawal (only for `insufficient_credits`)
+              schema:
+                type: string
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/RejectedWithdrawalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/withdrawals/{id}:
+    get:
+      tags: [Withdrawals]
+      operationId: getWithdrawal
+      summary: Status of a withdrawal
+      description: Trader or tenant admin, only the caller's own withdrawals.
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: The withdrawal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Withdrawal'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /health/startup:
+    get:
+      tags: [Health]
+      operationId: healthStartup
+      summary: Startup probe
+      description: Answers once the service listens; the migrations ran before that.
+      security: []
+      responses:
+        '200':
+          description: Up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: healthReady
+      summary: Readiness probe
+      description: The service's own database answers. Not ready (`503`) once the process is shutting down.
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The database does not answer, or the service is shutting down
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: healthLive
+      summary: Liveness probe
+      description: The process runs and the event loop answers; it never touches the database.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT from the identity provider, verified against its JWKS (issuer, audience and signature).
+        The token holds exactly one organization: the tenant is its alias in the `organization` claim, and the tenant
+        role (`tenant-admin` or `trader`) is the one group of that organization in `organization.<alias>.groups`
+        (`/tenant-admin` or `/trader`); a `tenant-admin` or `trader` realm role is ignored.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: '1 to 255 characters of A-Z a-z 0-9 . _ : - ; the same key and body from the same user give the same resource'
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9._:-]{1,255}$'
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      description: Id of a deposit or withdrawal of the caller; another user's or tenant's id answers 404
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: The request is invalid (a missing or malformed Idempotency-Key, an amount outside 1 to 1 000 000, a field the contract does not know); `errors` names the fields
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: The bearer token is missing or invalid (on the webhook, the signature is missing, wrong or too old)
+      headers:
+        WWW-Authenticate:
+          description: Bearer challenge (not sent for the webhook)
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: The token lacks the role `trader` or `tenant-admin`, or belongs to no tenant
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Not found (also the answer for another user's or another tenant's resources)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    IdempotencyKeyReused:
+      description: The Idempotency-Key was used before with another body (code `idempotency_key_reused`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: |
+        Try again after the time in `Retry-After`. Codes: `tenant_not_ready` (the tenant's schema does not exist yet),
+        `provider_unavailable` (the payment provider is down, its circuit is open), `trading_unavailable` (the circuit
+        to trading is open; the withdrawal was rejected), `identity_provider_unavailable` (the signing keys of the
+        identity provider cannot be fetched, so the token cannot be checked; a token that is wrong is answered `401`).
+      headers:
+        Retry-After:
+          description: Seconds to wait before the request is repeated
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: URI reference that identifies the problem type
+          examples: ['urn:chance:problem:idempotency-key-reused']
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          description: The request path
+        code:
+          type: string
+          description: Machine-readable problem code
+          examples: [insufficient_credits]
+        errors:
+          type: array
+          description: Invalid fields of a 400 answer
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+    RejectedWithdrawalProblem:
+      description: A problem; when a withdrawal was rejected, it names the stored withdrawal
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            withdrawalId:
+              type: string
+              format: uuid
+              description: Set for `insufficient_credits` and `trading_unavailable`; absent for `idempotency_key_reused`
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [up]
+    Amount:
+      type: integer
+      minimum: 1
+      maximum: 1000000
+      description: Credits = EUR cents; one unit everywhere, no conversion
+    CreateDepositRequest:
+      type: object
+      additionalProperties: false
+      required: [amount]
+      properties:
+        amount:
+          $ref: '#/components/schemas/Amount'
+    CreateWithdrawalRequest:
+      type: object
+      additionalProperties: false
+      required: [amount]
+      properties:
+        amount:
+          $ref: '#/components/schemas/Amount'
+    Deposit:
+      type: object
+      required: [id, userId, amount, status, checkoutUrl, failureReason, expiresAt, createdAt, updatedAt, completedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Amount'
+        status:
+          type: string
+          enum: [pending, succeeded, failed]
+        checkoutUrl:
+          type: [string, 'null']
+          description: The provider's payment page; null only if the provider has not answered yet
+        failureReason:
+          type: [string, 'null']
+          enum: [declined, expired, provider_unavailable, null]
+          description: Set when the status is `failed`
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the deposit was due to expire (30 minutes after it was made). Only the provider's read-back of the session ends a deposit that has a session; an open session keeps it pending
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: [string, 'null']
+          format: date-time
+    Withdrawal:
+      type: object
+      required: [id, userId, amount, status, reason, createdAt, updatedAt, completedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Amount'
+        status:
+          type: string
+          enum: [requested, debited, paid_out, rejected, failed, refunded]
+          description: |
+            `requested` (the debit is not known to be done; a job repeats it), `debited` (credits taken, the payout is
+            on its way), `paid_out`, `rejected` (nothing was debited), `failed` (the payout failed; trading refunds on its
+            own), `refunded` (trading refunded; the saga ended)
+        reason:
+          type: [string, 'null']
+          enum: [insufficient_credits, trading_unavailable, forced, declined, payout_lost, null]
+          description: Set when the status is `rejected`, `failed` or `refunded`
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: [string, 'null']
+          format: date-time
+          description: Set for `paid_out`, `rejected` and `refunded`
+    ProviderEvent:
+      type: object
+      description: The thin body of the provider's webhook (see the provider's contract)
+      required: [id, type, created, data]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Event id (`evt_` and 24 characters); the same for every attempt to deliver the event
+        type:
+          type: string
+          enum:
+            - checkout.session.completed
+            - checkout.session.declined
+            - checkout.session.expired
+            - payout.paid
+            - payout.failed
+        created:
+          type: string
+          format: date-time
+        data:
+          type: object
+          required: [object, id]
+          properties:
+            object:
+              type: string
+              enum: [checkout_session, payout]
+            id:
+              type: string
+              minLength: 1
+              maxLength: 255
+    WebhookAck:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [processed, duplicate, ignored]

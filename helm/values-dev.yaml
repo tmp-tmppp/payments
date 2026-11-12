@@ -1,0 +1,7 @@
+# Dev overrides (a local cluster): more logging, everything else as in values.yaml.
+env:
+  APP_ENV: dev
+  LOG_LEVEL: debug
+
+runtime:
+  logLevel: debug

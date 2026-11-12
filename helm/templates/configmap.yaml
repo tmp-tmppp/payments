@@ -1,0 +1,17 @@
+{{- if eq (int .Values.metrics.port) (int .Values.service.port) }}
+{{- fail "metrics.port must differ from service.port: the API port never serves /metrics" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "payments.fullname" . }}
+  labels:
+    {{- include "payments.labels" . | nindent 4 }}
+data:
+  PORT: {{ .Values.service.port | quote }}
+  METRICS_PORT: {{ .Values.metrics.port | quote }}
+  # The directory of the second ConfigMap (templates/runtime-configmap.yaml), mounted by the Deployment.
+  RUNTIME_CONFIG_DIR: {{ include "payments.runtimeDir" . | quote }}
+  {{- range $key, $value := .Values.env }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
