@@ -3,7 +3,7 @@
 # (the same Node.js major as "engines" in package.json); Dependabot proposes updates.
 
 # --- build stage -------------------------------------------------------------------------------------------
-FROM node:24.22.2-trixie-slim@sha256:0820eaa85e07d0490446dd01d14707e17e6108a36988cf374899cd057eb3812d AS build
+FROM node:26.13.1-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS build
 WORKDIR /app
 
 # Dependencies first, so this layer stays cached while only the source changes.
@@ -15,7 +15,7 @@ COPY src ./src
 RUN npm run build
 
 # --- runtime stage -----------------------------------------------------------------------------------------
-FROM node:24.22.2-trixie-slim@sha256:0820eaa85e07d0490446dd01d14707e17e6108a36988cf374899cd057eb3812d AS runtime
+FROM node:26.13.1-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
